@@ -1,6 +1,22 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router'
+  import { RouterLink, RouterView } from 'vue-router'
+  import { onMounted } from 'vue';
 
+  import FoxgloveWebSocketPlayer from './players/FoxgloveWebSocketPlayer';
+
+  onMounted(() => {
+    // 简易的 Mock 对象，防止构造函数报错
+    const mockMetrics = {
+      playerConstructed: () => {},
+      // 如果有其他必填方法在这里补上空函数
+    } as any;
+
+    const player = new FoxgloveWebSocketPlayer({
+      url: "ws://127.0.0.1:8765", // 确保和你 Python 端口一致
+      metricsCollector: mockMetrics,
+      sourceId: "my-test-source"
+    });
+  });
 </script>
 
 <template>
