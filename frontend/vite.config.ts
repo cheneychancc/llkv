@@ -18,6 +18,7 @@ export default defineConfig({
       '@lichtblick/suite': fileURLToPath(new URL('./src/suite', import.meta.url)),
       '@lichtblick/suite-base': fileURLToPath(new URL('./src/suite-base', import.meta.url)),
       '@lichtblick/mcap-support': fileURLToPath(new URL('./src/mcap-support', import.meta.url)),
+      '@lichtblick/den/async': fileURLToPath(new URL('./src/den/async', import.meta.url)),
     },
   },
 })

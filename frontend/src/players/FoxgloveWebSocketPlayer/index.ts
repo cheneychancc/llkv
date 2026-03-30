@@ -12,7 +12,7 @@ import {
   FetchAssetResponse,
   BinaryOpcode,
 } from "@foxglove/ws-protocol";
-
+import * as base64 from "@protobufjs/base64";
 import {
   AdvertiseOptions,
   MessageEvent,
@@ -35,12 +35,18 @@ import {
   Time,
 } from "@lichtblick/rostime";
 
+import * as _ from "lodash-es";
 import { v4 as uuidv4 } from "uuid";
 import { ParameterValue } from "@lichtblick/suite";
+
+import { debouncePromise } from "@lichtblick/den/async";
+import { parseChannel } from "@lichtblick/mcap-support";
+
 import { Asset } from "@lichtblick/suite-base/components/PanelExtensionAdapter";
 import PlayerAlertManager from "@lichtblick/suite-base/players/PlayerAlertManager";
 import { PLAYER_CAPABILITIES } from "@lichtblick/suite-base/players/constants";
 import { estimateObjectSize } from "@lichtblick/suite-base/players/messageMemoryEstimation";
+import { MessageDefinition, isMsgDefEqual } from "@lichtblick/message-definition";
 import {
   MessageWriter,
   MessageDefinitionMap,
@@ -48,8 +54,12 @@ import {
   ResolvedChannel,
   ResolvedService,
 } from "./types";
-
+import { dataTypeToFullName, statusLevelToAlertSeverity } from "./helpers";
 import WorkerSocketAdapter from "./WorkerSocketAdapter";
+
+
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 export default class FoxgloveWebSocketPlayer implements Player {
   readonly #sourceId: string;
@@ -145,14 +155,31 @@ export default class FoxgloveWebSocketPlayer implements Player {
     }
     console.info(`Opening connection to ${this.#url}`);
 
-    // 1. 初始化客户端 (先强制用原生的 WebSocket 保证链路通畅)
+    // Set a timeout to abort the connection if we are still not connected by then.
+    // This will abort hanging connection attempts that can for whatever reason not
+    // establish a connection with the server.
+    this.#connectionAttemptTimeout = setTimeout(() => {
+      this.#client?.close();
+    }, 10000);
+
+    // 1. 初始化客户端
     const subprotocols = [FoxgloveClient.SUPPORTED_SUBPROTOCOL, "foxglove.sdk.v1"];
     this.#client = new FoxgloveClient({
-      ws: new WebSocket(this.#url, subprotocols),
+      ws:
+        typeof Worker !== "undefined"
+          ? new WorkerSocketAdapter(this.#url, subprotocols)
+          : new WebSocket(this.#url, subprotocols),
     });
 
     // 2. 绑定核心事件监听
     this.#client.on("open", () => {
+      if (this.#closed) {
+        return;
+      }
+      // 去掉超时停止连接计时器
+      if (this.#connectionAttemptTimeout != undefined) {
+        clearTimeout(this.#connectionAttemptTimeout);
+      }
       console.log("✅ WebSocket 已连接");
       this.#presence = PlayerPresence.INITIALIZING;
     });
@@ -173,41 +200,123 @@ export default class FoxgloveWebSocketPlayer implements Player {
       this.#presence = PlayerPresence.INITIALIZING;
     });
 
-    // 3. 监听频道（话题）发现
+    // // 3. 监听频道（话题）发现
+    // this.#client.on("advertise", (newChannels) => {
+    //   console.log(`📣 发现 ${newChannels.length} 个新话题`);
+
+    //   if (!this.#client) {
+    //     return;
+    //   }
+
+    //   // for (const topic of this.#unresolvedSubscriptions) {
+    //   //   const chanInfo = this.#channelsByTopic.get(topic);
+    //   //   if (chanInfo) {
+    //   //     const subId = this.#client.subscribe(chanInfo.channel.id);
+    //   //     this.#unresolvedSubscriptions.delete(topic);
+    //   //     this.#resolvedSubscriptionsByTopic.set(topic, subId);
+    //   //     this.#resolvedSubscriptionsById.set(subId, chanInfo);
+    //   //   }
+    //   // }
+    //   // 记录频道信息 (ID -> Topic)
+    //   for (const ch of newChannels) {
+    //     this.#channelsById.set(ch.id, {
+    //       id: ch.id,
+    //       topic: ch.topic,
+    //       encoding: ch.encoding,
+    //       schemaName: ch.schemaName,
+    //       // schema: ch.schema (这里如果是 Protobuf 需要进一步处理)
+    //     });
+    //   }
+    //   console.log('频道信息：', newChannels)
+    //   // 关键：为了看到数据，我们要主动订阅
+    //   const ids = newChannels.map(c => c.id);
+    //   this.#client?.subscribe(ids);
+    //   console.log("📤 已发送订阅请求:", ids);
+    // });
+    // this.#client.on("status", (status) => {
+    //   console.log("🔔 收到服务器状态更新:", status);
+    // });
     this.#client.on("advertise", (newChannels) => {
-      console.log(`📣 发现 ${newChannels.length} 个新话题`);
-
-      if (!this.#client) {
-        return;
+      console.log("🔍 收到广告频道信息:", newChannels);
+      for (const channel of newChannels) {
+        let parsedChannel;
+        try {
+          let schemaEncoding;
+          let schemaData;
+          if (
+            channel.encoding === "json" &&
+            (channel.schemaEncoding == undefined || channel.schemaEncoding === "jsonschema")
+          ) {
+            schemaEncoding = "jsonschema";
+            schemaData = textEncoder.encode(channel.schema);
+          } else if (
+            channel.encoding === "protobuf" &&
+            (channel.schemaEncoding == undefined || channel.schemaEncoding === "protobuf")
+          ) {
+            schemaEncoding = "protobuf";
+            schemaData = new Uint8Array(base64.length(channel.schema));
+            if (base64.decode(channel.schema, schemaData, 0) !== schemaData.byteLength) {
+              throw new Error(`Failed to decode base64 schema on channel ${channel.id}`);
+            }
+          } else if (
+            channel.encoding === "flatbuffer" &&
+            (channel.schemaEncoding == undefined || channel.schemaEncoding === "flatbuffer")
+          ) {
+            schemaEncoding = "flatbuffer";
+            schemaData = new Uint8Array(base64.length(channel.schema));
+            if (base64.decode(channel.schema, schemaData, 0) !== schemaData.byteLength) {
+              throw new Error(`Failed to decode base64 schema on channel ${channel.id}`);
+            }
+          } else if (
+            channel.encoding === "ros1" &&
+            (channel.schemaEncoding == undefined || channel.schemaEncoding === "ros1msg")
+          ) {
+            schemaEncoding = "ros1msg";
+            schemaData = textEncoder.encode(channel.schema);
+          } else if (
+            channel.encoding === "cdr" &&
+            (channel.schemaEncoding == undefined ||
+              ["ros2idl", "ros2msg", "omgidl"].includes(channel.schemaEncoding))
+          ) {
+            schemaEncoding = channel.schemaEncoding ?? "ros2msg";
+            schemaData = textEncoder.encode(channel.schema);
+          } else {
+            const msg = channel.schemaEncoding
+              ? `Unsupported combination of message / schema encoding: (${channel.encoding} / ${channel.schemaEncoding})`
+              : `Unsupported message encoding ${channel.encoding}`;
+            throw new Error(msg);
+          }
+          parsedChannel = parseChannel({
+            messageEncoding: channel.encoding,
+            schema: { name: channel.schemaName, encoding: schemaEncoding, data: schemaData },
+          });
+        } catch (error) {
+          this.#unsupportedChannelIds.add(channel.id);
+          this.#alerts.addAlert(`schema:${channel.topic}`, {
+            severity: "error",
+            message: `Failed to parse channel schema on ${channel.topic}`,
+            error,
+          });
+          this.#emitState();
+          continue;
+        }
+        console.log("🔍 解析后的频道信息:", this.#channelsByTopic);
+        const existingChannel = this.#channelsByTopic.get(channel.topic);
+        if (existingChannel && !_.isEqual(channel, existingChannel.channel)) {
+          this.#alerts.addAlert(`duplicate-topic:${channel.topic}`, {
+            severity: "error",
+            message: `Multiple channels advertise the same topic: ${channel.topic} (${existingChannel.channel.id} and ${channel.id})`,
+          });
+          this.#emitState();
+          continue;
+        }
+        const resolvedChannel = { channel, parsedChannel };
+        this.#channelsById.set(channel.id, resolvedChannel);
+        this.#channelsByTopic.set(channel.topic, resolvedChannel);
       }
-
-      // for (const topic of this.#unresolvedSubscriptions) {
-      //   const chanInfo = this.#channelsByTopic.get(topic);
-      //   if (chanInfo) {
-      //     const subId = this.#client.subscribe(chanInfo.channel.id);
-      //     this.#unresolvedSubscriptions.delete(topic);
-      //     this.#resolvedSubscriptionsByTopic.set(topic, subId);
-      //     this.#resolvedSubscriptionsById.set(subId, chanInfo);
-      //   }
-      // }
-      // 记录频道信息 (ID -> Topic)
-      for (const ch of newChannels) {
-        this.#channelsById.set(ch.id, {
-          id: ch.id,
-          topic: ch.topic,
-          encoding: ch.encoding,
-          schemaName: ch.schemaName,
-          // schema: ch.schema (这里如果是 Protobuf 需要进一步处理)
-        });
-      }
-      console.log('频道信息：', newChannels)
-      // 关键：为了看到数据，我们要主动订阅
-      const ids = newChannels.map(c => c.id);
-      this.#client?.subscribe(ids);
-      console.log("📤 已发送订阅请求:", ids);
-    });
-    this.#client.on("status", (status) => {
-      console.log("🔔 收到服务器状态更新:", status);
+      this.#updateTopicsAndDatatypes();
+      this.#emitState();
+      this.#processUnresolvedSubscriptions();
     });
     // 4. 监听原始消息
     this.#client.on("message", ({ subscriptionId, data }) => {
@@ -277,11 +386,94 @@ export default class FoxgloveWebSocketPlayer implements Player {
   //   this.#client.on("fetchAssetResponse", (response) => {});
   // };
 
-  #updateTopicsAndDatatypes() {}
+  #updateTopicsAndDatatypes() {
+    // Build a new topics array from this._channelsById
+    const topics: Topic[] = Array.from(this.#channelsById.values(), (chanInfo) => ({
+      name: chanInfo.channel.topic,
+      schemaName: chanInfo.channel.schemaName,
+    }));
+
+    // Remove stats entries for removed topics
+    const topicsSet = new Set<string>(topics.map((topic) => topic.name));
+    const topicStats = new Map(this.#topicsStats);
+    for (const topic of topicStats.keys()) {
+      if (!topicsSet.has(topic)) {
+        topicStats.delete(topic);
+      }
+    }
+
+    this.#topicsStats = topicStats;
+    this.#topics = topics;
+
+    // Update the _datatypes map;
+    for (const { parsedChannel } of this.#channelsById.values()) {
+      this.#updateDataTypes(parsedChannel.datatypes);
+    }
+
+    this.#emitState();
+  }
 
   // Potentially performance-sensitive; await can be expensive
   // eslint-disable-next-line @typescript-eslint/promise-function-async
-  // #emitState = debouncePromise(() => {});
+  #emitState = debouncePromise(() => {
+    if (!this.#listener || this.#closed) {
+      return Promise.resolve();
+    }
+
+    if (!this.#topics) {
+      return this.#listener({
+        name: this.#name,
+        presence: this.#presence,
+        progress: {},
+        capabilities: this.#playerCapabilities,
+        profile: undefined,
+        playerId: this.#id,
+        activeData: undefined,
+        alerts: this.#alerts.alerts(),
+        urlState: this.#urlState,
+      });
+    }
+
+    const currentTime = this.#getCurrentTime();
+    if (!this.#startTime || isLessThan(currentTime, this.#startTime)) {
+      this.#startTime = currentTime;
+    }
+    if (!this.#endTime || isGreaterThan(currentTime, this.#endTime)) {
+      this.#endTime = currentTime;
+    }
+
+    const messages = this.#parsedMessages;
+    this.#parsedMessages = [];
+    this.#parsedMessagesBytes = 0;
+    return this.#listener({
+      name: this.#name,
+      presence: this.#presence,
+      progress: {},
+      capabilities: this.#playerCapabilities,
+      profile: this.#profile,
+      playerId: this.#id,
+      alerts: this.#alerts.alerts(),
+      urlState: this.#urlState,
+
+      activeData: {
+        messages,
+        totalBytesReceived: this.#receivedBytes,
+        startTime: this.#startTime,
+        endTime: this.#endTime,
+        currentTime,
+        isPlaying: true,
+        speed: 1,
+        lastSeekTime: this.#numTimeSeeks,
+        topics: this.#topics,
+        topicStats: this.#topicsStats,
+        datatypes: this.#datatypes,
+        parameters: this.#parameters,
+        publishedTopics: this.#publishedTopics,
+        subscribedTopics: this.#subscribedTopics,
+        services: this.#advertisedServices,
+      },
+    });
+  });
 
   public setListener() {}
 
@@ -289,7 +481,31 @@ export default class FoxgloveWebSocketPlayer implements Player {
 
   public setSubscriptions() {}
 
-  #processUnresolvedSubscriptions() {}
+  #processUnresolvedSubscriptions() {
+    if (!this.#client) {
+      return;
+    }
+    // --- 核心改动：如果当前没有订阅要求，自动把所有发现的话题塞进来 ---
+    if (this.#unresolvedSubscriptions.size === 0) {
+      console.log("💡 检测到订阅列表为空，准备全量订阅所有话题...");
+      for (const topicName of this.#channelsByTopic.keys()) {
+        this.#unresolvedSubscriptions.add(topicName);
+      }
+    }
+    // ---------------------------------------------------------
+
+    console.log("🔍 当前待处理的订阅列表:", Array.from(this.#unresolvedSubscriptions));
+    for (const topic of this.#unresolvedSubscriptions) {
+      const chanInfo = this.#channelsByTopic.get(topic);
+      if (chanInfo) {
+        console.log("🔍 处理未解析的订阅:", chanInfo);
+        const subId = this.#client.subscribe(chanInfo.channel.id);
+        this.#unresolvedSubscriptions.delete(topic);
+        this.#resolvedSubscriptionsByTopic.set(topic, subId);
+        this.#resolvedSubscriptionsById.set(subId, chanInfo);
+      }
+    }
+  }
 
   public setPublishers() {}
 
@@ -319,5 +535,31 @@ export default class FoxgloveWebSocketPlayer implements Player {
 
   #resetSessionState(): void {}
 
-  #updateDataTypes(): void {}
+  #updateDataTypes(datatypes: MessageDefinitionMap): void {
+    let updatedDatatypes: MessageDefinitionMap | undefined = undefined;
+    const maybeRos = ["ros1", "ros2"].includes(this.#profile ?? "");
+    for (const [name, types] of datatypes) {
+      const knownTypes = this.#datatypes.get(name);
+      if (knownTypes && !isMsgDefEqual(types, knownTypes)) {
+        this.#alerts.addAlert(`schema-changed-${name}`, {
+          message: `Definition of schema '${name}' has changed during the server's runtime`,
+          severity: "error",
+        });
+      } else {
+        updatedDatatypes ??= new Map(this.#datatypes);
+        updatedDatatypes.set(name, types);
+
+        const fullTypeName = dataTypeToFullName(name);
+        if (maybeRos && fullTypeName !== name) {
+          updatedDatatypes.set(fullTypeName, {
+            ...types,
+            name: types.name ? dataTypeToFullName(types.name) : undefined,
+          });
+        }
+      }
+    }
+    if (updatedDatatypes != undefined) {
+      this.#datatypes = updatedDatatypes; // Signal that datatypes changed.
+    }
+  }
 }

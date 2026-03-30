@@ -13,6 +13,8 @@
       "@lichtblick/suite/*": ["./src/suite/*"],
       "@lichtblick/suite-base": ["./src/suite-base/index.ts"],
       "@lichtblick/suite-base/*": ["./src/suite-base/*"],
+      "@lichtblick/den/async": ["./src/den/async/index.ts"],
+      "@lichtblick/den/async/*": ["./src/den/async/*"],
       "@lichtblick/mcap-support": ["./src/mcap-support/index.ts"],
       "@lichtblick/mcap-support/*": ["./src/mcap-support/*"]
     },
@@ -24,6 +26,7 @@
     // verbatimModuleSyntax 是 TypeScript 的一个编译选项
     // 开启后要求：如果导入的是类型（type），必须显式使用 import type 语法，不能用普通的 import
     "verbatimModuleSyntax": false,
-    "moduleResolution": "node"
+    "moduleResolution": "node",
+    "lib": ["dom", "dom.iterable", "es2022", "webworker", "ESNext.Disposable"]
   }
 }

@@ -23,7 +23,7 @@ export default class WorkerSocketAdapter implements IWebSocket {
     // foxglove-depcheck-used: babel-plugin-transform-import-meta
     this.#worker = new Worker(new URL("./worker", import.meta.url));
     this.#sendToWorker({ type: "open", data: { wsUrl, protocols } });
-
+    console.log("this.#worker", this.#worker);
     this.#worker.onerror = (ev) => {
       if (this.onerror) {
         this.onerror(ev);
